@@ -1,340 +1,167 @@
--- Welcome to the script magic test beta 1.1
+local enabled, lastHit, lastToggle, lastSpell = {}, {}, {}, {}
+local nextZone = 0
 
-local on = false
-
-local CFG = {}
-CFG.RANGE = 35.0
-
-CFG.LASER_RGBA = { 15, 0, 15, 220 }
-CFG.MARKER_RGBA = { 15, 0, 15, 160 }
-
-CFG.FIRE_ENABLED = true
-CFG.PATCH_LIFE_MS = 2000
-CFG.PATCH_STEP_DIST = 0.9
-CFG.PATCH_MAX = 40
-
-CFG.CHANNEL_KEY = 38
-
-CFG.AUTO_OFF_ON_DEATH = true
-CFG.AUTO_OFF_ON_UNARMED = true
-
-CFG.PTFX_ASSET = "core"
-CFG.PTFX_BEAM = "ent_amb_smoke_black"
-CFG.PTFX_IMPACT = "ent_amb_smoke_black"
-
-CFG.BEAM_STEPS = 26
-CFG.BEAM_SCALE_MAIN = 1.05
-CFG.BEAM_SCALE_SECOND = 0.75
-
-CFG.IMPACT_SCALE_A = 1.75
-CFG.IMPACT_SCALE_B = 1.35
-CFG.IMPACT_SCALE_C = 1.10
-
-CFG.VEHICLE_DAMAGE = true
-CFG.VEH_ENGINE_MINUS = 45.0
-CFG.VEH_BODY_MINUS = 25.0
-
-CFG.RAY_FLAGS = (1 + 2 + 8)
-
-local ptfxLoaded = false
-local patches = {}
-local lastPatchPos = nil
-local lastWeapon = nil
-local lastDead = false
-
-local function rotToDir(r)
-    local z = math.rad(r.z)
-    local x = math.rad(r.x)
-    local c = math.abs(math.cos(x))
-    return vector3(-math.sin(z) * c, math.cos(z) * c, math.sin(x))
+local function allowed(src)
+    return IsPlayerAceAllowed(src, Config.AcePermission)
 end
 
-local function vdist(a, b)
-    return #(a - b)
-end
-
-local function vadd(a, b)
-    return vector3(a.x + b.x, a.y + b.y, a.z + b.z)
-end
-
-local function vsub(a, b)
-    return vector3(a.x - b.x, a.y - b.y, a.z - b.z)
-end
-
-local function vscale(a, s)
-    return vector3(a.x * s, a.y * s, a.z * s)
-end
-
-local function loadPtfx()
-    if ptfxLoaded then return end
-    RequestNamedPtfxAsset(CFG.PTFX_ASSET)
-    while not HasNamedPtfxAssetLoaded(CFG.PTFX_ASSET) do
-        Wait(0)
-    end
-    ptfxLoaded = true
-end
-
-local function getRightHandPos(ped)
-    local bone = GetPedBoneIndex(ped, 57005)
-    local x, y, z = table.unpack(GetWorldPositionOfEntityBone(ped, bone))
-    local f = GetEntityForwardVector(ped)
-    return vector3(x, y, z) + vector3(f.x, f.y, f.z) * 0.12
-end
-
-local function raycastFromCamera(ped)
-    local camC = GetGameplayCamCoord()
-    local camR = GetGameplayCamRot(2)
-    local dir = rotToDir(camR)
-    local dest = camC + dir * CFG.RANGE
-
-    local ray = StartShapeTestRay(
-        camC.x, camC.y, camC.z,
-        dest.x, dest.y, dest.z,
-        CFG.RAY_FLAGS,
-        ped,
-        7
-    )
-
-    local _, hit, endc, _, ent = GetShapeTestResult(ray)
-    if hit == 1 then
-        return vector3(endc.x, endc.y, endc.z), ent or 0
-    end
-    return dest, 0
-end
-
-local function drawLaser(a, b)
-    DrawLine(a.x, a.y, a.z, b.x, b.y, b.z, CFG.LASER_RGBA[1], CFG.LASER_RGBA[2], CFG.LASER_RGBA[3], CFG.LASER_RGBA[4])
-    DrawMarker(28, b.x, b.y, b.z, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.09, 0.09, 0.09,
-        CFG.MARKER_RGBA[1], CFG.MARKER_RGBA[2], CFG.MARKER_RGBA[3], CFG.MARKER_RGBA[4],
-        false, true, 2, false, nil, nil, false
-    )
-end
-
-local function smokeAt(pos, scale)
-    UseParticleFxAssetNextCall(CFG.PTFX_ASSET)
-    StartParticleFxNonLoopedAtCoord(CFG.PTFX_BEAM, pos.x, pos.y, pos.z, 0.0, 0.0, 0.0, scale, false, false, false)
-end
-
-local function impactAt(pos)
-    UseParticleFxAssetNextCall(CFG.PTFX_ASSET)
-    StartParticleFxNonLoopedAtCoord(CFG.PTFX_IMPACT, pos.x, pos.y, pos.z, 0.0, 0.0, 0.0, CFG.IMPACT_SCALE_A, false, false, false)
-    smokeAt(pos + vector3(0.0, 0.0, 0.25), CFG.IMPACT_SCALE_B)
-    smokeAt(pos + vector3(0.0, 0.0, 0.50), CFG.IMPACT_SCALE_C)
-end
-
-local function removePatch(i)
-    local p = patches[i]
-    if not p then return end
-    if p.fire then
-        RemoveScriptFire(p.fire)
-    end
-    table.remove(patches, i)
-end
-
-local function cleanupPatches()
+local function throttled(store, key, ms)
     local now = GetGameTimer()
-    for i = #patches, 1, -1 do
-        local p = patches[i]
-        if (now - p.t) >= CFG.PATCH_LIFE_MS then
-            removePatch(i)
-        end
-    end
+    if store[key] and now - store[key] < ms then return true end
+    store[key] = now
+    return false
 end
 
-local function clearAllPatches()
-    for i = #patches, 1, -1 do
-        removePatch(i)
-    end
-    patches = {}
-    lastPatchPos = nil
+local function finite(v)
+    local n = tonumber(v)
+    if not n or n ~= n or n == math.huge or n == -math.huge then return nil end
+    return n
 end
 
-local function addPatch(pos)
-    if #patches >= CFG.PATCH_MAX then
-        removePatch(1)
-    end
-
-    local fire = nil
-    if CFG.FIRE_ENABLED then
-        fire = StartScriptFire(pos.x, pos.y, pos.z, 2, false)
-    end
-
-    patches[#patches + 1] = { pos = pos, t = GetGameTimer(), fire = fire }
-    lastPatchPos = pos
+local function setState(src, state)
+    enabled[src] = state or nil
+    if not state then Player(src).state:set('darkmagic', false, true) end
+    TriggerClientEvent('darkmagic:setState', src, state == true)
 end
 
-local function maybeDropPatch(pos)
-    if not lastPatchPos then
-        addPatch(pos)
+local function toggle(src)
+    if throttled(lastToggle, src, 500) then return end
+    if not allowed(src) then
+        TriggerClientEvent('darkmagic:denied', src)
         return
     end
-    if vdist(pos, lastPatchPos) >= CFG.PATCH_STEP_DIST then
-        addPatch(pos)
-    end
+    setState(src, not enabled[src])
 end
 
-local function tryDamageVehicle(ent)
-    if not CFG.VEHICLE_DAMAGE then return end
-    if not ent or ent == 0 then return end
-    if not IsEntityAVehicle(ent) then return end
-
-    if not NetworkHasControlOfEntity(ent) then
-        NetworkRequestControlOfEntity(ent)
-    end
-
-    if NetworkHasControlOfEntity(ent) then
-        local eng = GetVehicleEngineHealth(ent)
-        local bod = GetVehicleBodyHealth(ent)
-        SetVehicleEngineHealth(ent, eng - CFG.VEH_ENGINE_MINUS)
-        SetVehicleBodyHealth(ent, bod - CFG.VEH_BODY_MINUS)
-    end
+local function casterPed(src)
+    if not enabled[src] or not allowed(src) then return nil end
+    local ped = GetPlayerPed(src)
+    if ped == 0 or GetEntityHealth(ped) <= 0 then return nil end
+    return ped
 end
 
-local function isChanneling()
-    return IsControlPressed(0, CFG.CHANNEL_KEY)
+local function withinOf(ped, target, extra)
+    return #(GetEntityCoords(ped) - target) <= Config.Range + extra
 end
 
-local function blockCombat()
-    DisableControlAction(0, 24, true)
-    DisableControlAction(0, 25, true)
-    DisableControlAction(0, 140, true)
-    DisableControlAction(0, 141, true)
-    DisableControlAction(0, 142, true)
+local function chargeOf(v)
+    local ch = finite(v)
+    if not ch and tonumber(v) == math.huge then ch = 1.0 end
+    if not ch then return nil end
+    return math.min(math.max(ch, 0.0), 1.0)
 end
 
-local function shouldAutoOffDeath(ped)
-    if not CFG.AUTO_OFF_ON_DEATH then return false end
-    return IsEntityDead(ped) == 1
+local function pointOf(x, y, z)
+    x, y, z = finite(x), finite(y), finite(z)
+    if not (x and y and z) then return nil end
+    if math.abs(x) > 20000 or math.abs(y) > 20000 or math.abs(z) > 5000 then return nil end
+    return vector3(x, y, z)
 end
 
-local function shouldAutoOffUnarmed(ped)
-    if not CFG.AUTO_OFF_ON_UNARMED then return false end
-    local w = GetSelectedPedWeapon(ped)
-    return w == `WEAPON_UNARMED`
-end
+RegisterCommand('darkmagic', function(src)
+    if src ~= 0 then toggle(src) end
+end, false)
 
-local function setOn(v)
-    if on == v then return end
-    on = v
-    if not on then
-        clearAllPatches()
-    end
-end
+RegisterCommand('darkmagicoff', function(src)
+    if src ~= 0 then setState(src, false) end
+end, false)
 
-local function forceOff()
-    setOn(false)
-end
-
-local function channelTick(ped, startPos, endPos, ent)
-    loadPtfx()
-
-    local steps = CFG.BEAM_STEPS
-    local delta = vscale(vsub(endPos, startPos), 1.0 / steps)
-
-    local p = startPos
-    for i = 1, steps do
-        p = vadd(p, delta)
-        smokeAt(p, CFG.BEAM_SCALE_MAIN)
-        if (i % 2) == 0 then
-            smokeAt(p, CFG.BEAM_SCALE_SECOND)
-        end
-    end
-
-    impactAt(endPos)
-    maybeDropPatch(endPos)
-    tryDamageVehicle(ent)
-end
-
-RegisterNetEvent('darkmagic:toggle', function()
-    setOn(not on)
+RegisterNetEvent('darkmagic:requestToggle', function()
+    toggle(source)
 end)
 
-RegisterNetEvent('darkmagic:forceoff', function()
-    forceOff()
+RegisterNetEvent('darkmagic:clientOff', function()
+    enabled[source] = nil
+    Player(source).state:set('darkmagic', false, true)
 end)
 
-CreateThread(function()
-    while true do
-        if on then
-            local ped = PlayerPedId()
+RegisterNetEvent('darkmagic:hit', function(targetId, charge)
+    local src = source
+    if not Config.Damage.players.enabled then return end
+    local target = tonumber(targetId)
+    if not target or target == src then return end
+    local ch = chargeOf(charge)
+    if not ch then return end
 
-            if shouldAutoOffDeath(ped) then
-                forceOff()
-                Wait(250)
-            elseif shouldAutoOffUnarmed(ped) then
-                forceOff()
-                Wait(250)
-            else
-                local s = getRightHandPos(ped)
-                local e, ent = raycastFromCamera(ped)
+    local ped = casterPed(src)
+    local targetPed = GetPlayerPed(target)
+    if not ped or targetPed == 0 then return end
+    if throttled(lastHit, src, Config.Damage.intervalMs - 60) then return end
+    if GetPlayerRoutingBucket(src) ~= GetPlayerRoutingBucket(target) then return end
+    if not withinOf(ped, GetEntityCoords(targetPed), 15.0) then return end
 
-                drawLaser(s, e)
+    local dmg = math.floor(Config.Damage.ped.amount * ch)
+    if dmg <= 0 then return end
+    TriggerClientEvent('darkmagic:takeHit', target, src, dmg)
+end)
 
-                if isChanneling() then
-                    channelTick(ped, s, e, ent)
-                end
+RegisterNetEvent('darkmagic:hitVehicle', function(netId, charge)
+    local src = source
+    if not Config.Damage.vehicle.enabled then return end
+    local ch = chargeOf(charge)
+    local id = tonumber(netId)
+    if not ch or not id then return end
 
-                cleanupPatches()
-                blockCombat()
-                Wait(0)
-            end
-        else
-            Wait(250)
-        end
+    local ped = casterPed(src)
+    if not ped then return end
+    if throttled(lastHit, 'veh' .. src, Config.Damage.intervalMs - 60) then return end
+    local veh = NetworkGetEntityFromNetworkId(id)
+    if not veh or veh == 0 or GetEntityType(veh) ~= 2 then return end
+    if not withinOf(ped, GetEntityCoords(veh), 15.0) then return end
+
+    local owner = NetworkGetEntityOwner(veh)
+    if owner and owner > 0 then
+        TriggerClientEvent('darkmagic:vehicleHit', owner, id, Config.Damage.vehicle.engine * ch, Config.Damage.vehicle.body * ch)
     end
 end)
 
-CreateThread(function()
-    while true do
-        if on and CFG.AUTO_OFF_ON_UNARMED then
-            local ped = PlayerPedId()
-            local w = GetSelectedPedWeapon(ped)
+RegisterNetEvent('darkmagic:curse', function(x, y, z)
+    local src = source
+    local C = Config.Spells.curse
+    local pos = pointOf(x, y, z)
+    local ped = casterPed(src)
+    if not pos or not ped then return end
+    if throttled(lastSpell, 'curse' .. src, C.cooldownMs - 100) then return end
+    if not withinOf(ped, pos, 15.0) then return end
 
-            if lastWeapon == nil then
-                lastWeapon = w
-            end
+    nextZone = nextZone + 1
+    TriggerClientEvent('darkmagic:zone', -1, nextZone, src, pos.x, pos.y, pos.z, C.radius, C.durationMs)
+end)
 
-            if w ~= lastWeapon then
-                lastWeapon = w
-                if w == `WEAPON_UNARMED` then
-                    forceOff()
-                end
-            end
+RegisterNetEvent('darkmagic:blast', function(x, y, z, kind)
+    local src = source
+    if kind ~= 'burst' and kind ~= 'orb' then return end
+    local pos = pointOf(x, y, z)
+    local ped = casterPed(src)
+    if not pos or not ped then return end
+    if throttled(lastSpell, 'blast' .. src, 300) then return end
+    if not withinOf(ped, pos, Config.Range * (Config.Spells.orb.rangeMul - 1.0) + 15.0) then return end
 
-            Wait(150)
-        else
-            Wait(500)
-        end
+    TriggerClientEvent('darkmagic:blastFx', -1, src, pos.x, pos.y, pos.z, kind)
+end)
+
+AddStateBagChangeHandler('darkmagic', nil, function(bagName, _, value, _, replicated)
+    local src = tonumber(bagName:match('^player:(%d+)$'))
+    if src and replicated and value and not enabled[src] then
+        Player(src).state:set('darkmagic', false, true)
     end
 end)
 
-CreateThread(function()
-    while true do
-        if on and CFG.AUTO_OFF_ON_DEATH then
-            local ped = PlayerPedId()
-            local dead = (IsEntityDead(ped) == 1)
-
-            if dead and not lastDead then
-                lastDead = true
-                forceOff()
-            elseif not dead and lastDead then
-                lastDead = false
-            end
-
-            Wait(200)
-        else
-            Wait(500)
-        end
-    end
+AddEventHandler('playerDropped', function()
+    local src = source
+    enabled[src], lastHit[src], lastHit['veh' .. src], lastToggle[src] = nil, nil, nil, nil
+    lastSpell['curse' .. src], lastSpell['blast' .. src] = nil, nil
 end)
 
--- Useful Notes:
--- ScriptFire remains orange (color cannot be changed). The black smoke masks the orange.
+exports('setState', function(src, state)
+    src = tonumber(src)
+    if src and GetPlayerPed(src) ~= 0 then setState(src, state == true) end
+end)
 
--- If you want no orange: CFG.FIRE_ENABLED = false (you keep the visual "burn" as black smoke only).
+exports('isEnabled', function(src)
+    return enabled[tonumber(src)] == true
+end)
 
--- Raycast includes mapping + objects + vehicles (world + vehicles + objects).
-
--- Patches last 2 seconds and disappear naturally, even if you move the aiming reticle.
-
--- notes dev by fake
+if GetConvar('onesync', 'off') == 'off' then
+    print('[dark_magic] OneSync is required for player damage, curses and beam sync')
+end
