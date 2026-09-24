@@ -1,14 +1,21 @@
-local enabled, lastHit, lastToggle = {}, {}, {}
+local enabled, lastHit, lastToggle, lastSpell = {}, {}, {}, {}
+local nextZone = 0
 
 local function allowed(src)
     return IsPlayerAceAllowed(src, Config.AcePermission)
 end
 
-local function throttled(store, src, ms)
+local function throttled(store, key, ms)
     local now = GetGameTimer()
-    if store[src] and now - store[src] < ms then return true end
-    store[src] = now
+    if store[key] and now - store[key] < ms then return true end
+    store[key] = now
     return false
+end
+
+local function finite(v)
+    local n = tonumber(v)
+    if not n or n ~= n or n == math.huge or n == -math.huge then return nil end
+    return n
 end
 
 local function setState(src, state)
@@ -26,22 +33,29 @@ local function toggle(src)
     setState(src, not enabled[src])
 end
 
-local function casterOk(src, key)
+local function casterPed(src)
     if not enabled[src] or not allowed(src) then return nil end
-    if throttled(lastHit, key, Config.Damage.intervalMs - 60) then return nil end
     local ped = GetPlayerPed(src)
     if ped == 0 or GetEntityHealth(ped) <= 0 then return nil end
     return ped
 end
 
-local function inRange(a, b)
-    return #(GetEntityCoords(a) - GetEntityCoords(b)) <= Config.Range + 15.0
+local function withinOf(ped, target, extra)
+    return #(GetEntityCoords(ped) - target) <= Config.Range + extra
 end
 
 local function chargeOf(v)
-    local ch = tonumber(v)
-    if not ch or ch ~= ch then return nil end
+    local ch = finite(v)
+    if not ch and tonumber(v) == math.huge then ch = 1.0 end
+    if not ch then return nil end
     return math.min(math.max(ch, 0.0), 1.0)
+end
+
+local function pointOf(x, y, z)
+    x, y, z = finite(x), finite(y), finite(z)
+    if not (x and y and z) then return nil end
+    if math.abs(x) > 20000 or math.abs(y) > 20000 or math.abs(z) > 5000 then return nil end
+    return vector3(x, y, z)
 end
 
 RegisterCommand('darkmagic', function(src)
@@ -69,11 +83,12 @@ RegisterNetEvent('darkmagic:hit', function(targetId, charge)
     local ch = chargeOf(charge)
     if not ch then return end
 
-    local casterPed = casterOk(src, src)
+    local ped = casterPed(src)
     local targetPed = GetPlayerPed(target)
-    if not casterPed or targetPed == 0 then return end
+    if not ped or targetPed == 0 then return end
+    if throttled(lastHit, src, Config.Damage.intervalMs - 60) then return end
     if GetPlayerRoutingBucket(src) ~= GetPlayerRoutingBucket(target) then return end
-    if not inRange(casterPed, targetPed) then return end
+    if not withinOf(ped, GetEntityCoords(targetPed), 15.0) then return end
 
     local dmg = math.floor(Config.Damage.ped.amount * ch)
     if dmg <= 0 then return end
@@ -87,16 +102,42 @@ RegisterNetEvent('darkmagic:hitVehicle', function(netId, charge)
     local id = tonumber(netId)
     if not ch or not id then return end
 
-    local casterPed = casterOk(src, 'veh' .. src)
-    if not casterPed then return end
+    local ped = casterPed(src)
+    if not ped then return end
+    if throttled(lastHit, 'veh' .. src, Config.Damage.intervalMs - 60) then return end
     local veh = NetworkGetEntityFromNetworkId(id)
     if not veh or veh == 0 or GetEntityType(veh) ~= 2 then return end
-    if not inRange(casterPed, veh) then return end
+    if not withinOf(ped, GetEntityCoords(veh), 15.0) then return end
 
     local owner = NetworkGetEntityOwner(veh)
     if owner and owner > 0 then
         TriggerClientEvent('darkmagic:vehicleHit', owner, id, Config.Damage.vehicle.engine * ch, Config.Damage.vehicle.body * ch)
     end
+end)
+
+RegisterNetEvent('darkmagic:curse', function(x, y, z)
+    local src = source
+    local C = Config.Spells.curse
+    local pos = pointOf(x, y, z)
+    local ped = casterPed(src)
+    if not pos or not ped then return end
+    if throttled(lastSpell, 'curse' .. src, C.cooldownMs - 100) then return end
+    if not withinOf(ped, pos, 15.0) then return end
+
+    nextZone = nextZone + 1
+    TriggerClientEvent('darkmagic:zone', -1, nextZone, src, pos.x, pos.y, pos.z, C.radius, C.durationMs)
+end)
+
+RegisterNetEvent('darkmagic:blast', function(x, y, z, kind)
+    local src = source
+    if kind ~= 'burst' and kind ~= 'orb' then return end
+    local pos = pointOf(x, y, z)
+    local ped = casterPed(src)
+    if not pos or not ped then return end
+    if throttled(lastSpell, 'blast' .. src, 300) then return end
+    if not withinOf(ped, pos, Config.Range * (Config.Spells.orb.rangeMul - 1.0) + 15.0) then return end
+
+    TriggerClientEvent('darkmagic:blastFx', -1, src, pos.x, pos.y, pos.z, kind)
 end)
 
 AddStateBagChangeHandler('darkmagic', nil, function(bagName, _, value, _, replicated)
@@ -107,7 +148,9 @@ AddStateBagChangeHandler('darkmagic', nil, function(bagName, _, value, _, replic
 end)
 
 AddEventHandler('playerDropped', function()
-    enabled[source], lastHit[source], lastHit['veh' .. source], lastToggle[source] = nil, nil, nil, nil
+    local src = source
+    enabled[src], lastHit[src], lastHit['veh' .. src], lastToggle[src] = nil, nil, nil, nil
+    lastSpell['curse' .. src], lastSpell['blast' .. src] = nil, nil
 end)
 
 exports('setState', function(src, state)
@@ -120,5 +163,5 @@ exports('isEnabled', function(src)
 end)
 
 if GetConvar('onesync', 'off') == 'off' then
-    print('[dark_magic] OneSync is required for player damage and beam sync')
+    print('[dark_magic] OneSync is required for player damage, curses and beam sync')
 end
